@@ -305,6 +305,8 @@ class EncodedSymbol:
         # violate monotonic scan constraints and are therefore unreliable.
         self.coordinates = coordinates
         self._duration: SymbolDuration | None = None
+        # Set only with --export: the decoded token's id in the export files.
+        self.export_id: str | None = None
 
     def is_control_symbol(self) -> bool:
         return self.rhythm in ("BOS", "EOS", "PAD")

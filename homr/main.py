@@ -27,8 +27,10 @@ from homr.brace_dot_detection import (
     find_braces_brackets_and_grand_staff_lines,
     prepare_brace_dot_image,
 )
+from homr import export
 from homr.debug import Debug
-from homr.model import InputPredictions, MultiStaff
+from homr.export import EXPORT
+from homr.model import InputPredictions, MultiStaff, Staff
 from homr.music_xml_generator import XmlGeneratorArguments, generate_xml
 from homr.noise_filtering import filter_predictions
 from homr.note_detection import add_notes_to_staffs, combine_noteheads_with_stems
@@ -114,22 +116,131 @@ def load_and_preprocess_predictions(
         raise InvalidProgramArgumentException(
             "The file format is not supported, please provide a JPG or PNG image file:" + image_path
         )
+    input_image = image
     image = autocrop(image)
+    crop = _crop_box(input_image, image)
+    cropped_size = (image.shape[1], image.shape[0])
     image = resize_image(image)
+    EXPORT.frame("input", {"width": input_image.shape[1], "height": input_image.shape[0]})
+    EXPORT.stage("autocrop", crop=crop)
     preprocessed = color_adjust.apply_clahe(image)
     predictions = get_predictions(image, preprocessed, image_path, enable_cache, segnet_use_gpu)
+    if EXPORT.on():
+        seg_h, seg_w = predictions.staff.shape[:2]
+        EXPORT.frame(
+            "work",
+            {
+                "width": seg_w,
+                "height": seg_h,
+                "from_input": {
+                    "crop": crop,
+                    "scale": [seg_w / cropped_size[0], seg_h / cropped_size[1]],
+                },
+            },
+        )
+        EXPORT.write_maps("staffdetect", "staffdetect/seg_raw.npz", _seg_maps(predictions))
+        EXPORT.stage("segnet")
     debug = Debug(predictions.original, image_path, enable_debug)
     debug.write_image("color_adjust", preprocessed)
 
     predictions = filter_predictions(predictions, debug)
 
     predictions.staff = make_lines_stronger(predictions.staff, (1, 2))
+    if EXPORT.on():
+        EXPORT.write_maps("staffdetect", "staffdetect/seg_filtered.npz", _seg_maps(predictions))
+        EXPORT.stage("noise_filter")
     debug.write_threshold_image("staff", predictions.staff)
     debug.write_threshold_image("symbols", predictions.symbols)
     debug.write_threshold_image("stems_rest", predictions.stems_rest)
     debug.write_threshold_image("notehead", predictions.notehead)
     debug.write_threshold_image("clefs_keys", predictions.clefs_keys)
     return predictions, debug
+
+
+def _crop_box(original: NDArray, cropped: NDArray) -> list[int]:
+    """Where autocrop's result (a view into the original) sits in the original image."""
+    if cropped.shape == original.shape:
+        return [0, 0, original.shape[1], original.shape[0]]
+    offset = cropped.__array_interface__["data"][0] - original.__array_interface__["data"][0]
+    y, rest = divmod(offset, original.strides[0])
+    x = rest // original.strides[1]
+    return [int(x), int(y), int(x + cropped.shape[1]), int(y + cropped.shape[0])]
+
+
+def _seg_maps(predictions: InputPredictions) -> dict[str, NDArray]:
+    return {
+        "staff": predictions.staff,
+        "symbols": predictions.symbols,
+        "stems_rest": predictions.stems_rest,
+        "notehead": predictions.notehead,
+        "clefs_keys": predictions.clefs_keys,
+    }
+
+
+def _export_candidates(**values: object) -> None:
+    if not EXPORT.on("staffdetect"):
+        return
+    out: dict[str, object] = {}
+    for key, value in values.items():
+        if isinstance(value, list):
+            out[key] = [export.rotated(getattr(v, "notehead", v)) for v in value]
+        else:
+            out[key] = value
+    EXPORT.write_json("staffdetect", "staffdetect/candidates.json", out)
+
+
+def _export_staffs(staffs: list[Staff]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": EXPORT.staff_id(s),
+            "box": export.staff_box(s),
+            "lines": export.staff_lines(s),
+            "line_spacing": round(float(s.average_unit_size), 3),
+            "grand": bool(s.is_grandstaff),
+        }
+        for s in staffs
+    ]
+
+
+def _export_geometry(multi_staffs: list[MultiStaff], notes: list[object]) -> None:
+    if not EXPORT.on("geometry"):
+        return
+    staffs = []
+    for system, multi in enumerate(multi_staffs):
+        for k, staff in enumerate(multi.staffs):
+            entry = _export_staffs([staff])[0]
+            entry["system"] = system
+            entry["index_in_system"] = k
+            symbols = []
+            for symbol in staff.symbols:
+                item: dict[str, object] = {"kind": type(symbol).__name__}
+                box = getattr(symbol, "box", None)
+                item["box"] = export.rotated(box)
+                for attr in ("position", "has_dot"):
+                    if hasattr(symbol, attr):
+                        item[attr] = getattr(symbol, attr)
+                stem = getattr(symbol, "stem", None)
+                if stem is not None:
+                    item["stem"] = export.rotated(stem)
+                direction = getattr(symbol, "stem_direction", None)
+                if direction is not None:
+                    item["stem_direction"] = str(direction)
+                symbols.append(item)
+            entry["symbols"] = symbols
+            staffs.append(entry)
+    EXPORT.write_json(
+        "geometry",
+        "geometry.json",
+        {
+            "frame": "work",
+            "staffs": staffs,
+            "connections": [
+                [export.rotated(c) for c in multi.connections] for multi in multi_staffs
+            ],
+            "unattached_notes": len(notes) if isinstance(notes, list) else None,
+            "beams": {"status": "not_available"},
+        },
+    )
 
 
 def predict_symbols(debug: Debug, predictions: InputPredictions) -> PredictedSymbols:
@@ -180,17 +291,42 @@ def process_image(
     eprint("Processing " + image_path)
     xml_file = replace_extension(image_path, ".musicxml")
     debug_cleanup: Debug | None = None
+    EXPORT.start_image(image_path, sys.argv[1:])
+    exit_status = "exception"
     try:
         if config.read_staff_positions:
             image = cv2.imread(image_path)
             if image is None:
                 raise ValueError("Failed to read " + image_path)
+            input_size = (image.shape[1], image.shape[0])
             image = resize_image(image)
+            EXPORT.frame("input", {"width": input_size[0], "height": input_size[1]})
+            EXPORT.frame(
+                "work",
+                {
+                    "width": image.shape[1],
+                    "height": image.shape[0],
+                    "from_input": {
+                        "crop": [0, 0, input_size[0], input_size[1]],
+                        "scale": [image.shape[1] / input_size[0], image.shape[0] / input_size[1]],
+                    },
+                },
+            )
             debug = Debug(image, image_path, config.enable_debug)
             staff_position_files = replace_extension(image_path, ".txt")
             multi_staffs = load_staff_positions(
                 debug, image, staff_position_files, config.selected_staff
             )
+            if EXPORT.on():
+                EXPORT.grouping_update(
+                    {
+                        "source": "read_staff_positions",
+                        "multi_staffs": [[EXPORT.staff_id(s) for s in m.staffs] for m in multi_staffs],
+                        "staffs_out": _export_staffs([s for m in multi_staffs for s in m.staffs]),
+                    }
+                )
+                _export_geometry(multi_staffs, [])
+                EXPORT.stage("read_staff_positions", systems=len(multi_staffs))
             title = ""
             # parse_staffs() expects a grayscale image (cv2.findContours requires it),
             # matching what the normal detect_staffs_in_image() path hands it
@@ -204,6 +340,13 @@ def process_image(
         transformer_config = Config()
         transformer_config.use_gpu_inference = config.transformer_use_gpu
         transformer_config.use_coreml_encoder = config.coreml_encoder
+        if EXPORT.on():
+            paths = transformer_config.filepaths
+            for name in ("encoder_path", "decoder_path", "encoder_path_fp16", "decoder_path_fp16"):
+                path = getattr(paths, name, None)
+                if isinstance(path, str):
+                    EXPORT.model(name, path)
+            EXPORT.model("segnet", segnet_path_onnx_fp16 if config.segnet_use_gpu else segnet_path_onnx)
 
         result_staffs = parse_staffs(
             debug,
@@ -217,8 +360,10 @@ def process_image(
             title = title_future.result(60)
         eprint("Found title:", title)
 
+        EXPORT.stage("decode", voices=len(result_staffs))
         eprint("Writing XML", result_staffs)
         xml = generate_xml(xml_generator_args, result_staffs, title)
+        EXPORT.stage("xml")
         ET.ElementTree(xml).write(xml_file, encoding="unicode", xml_declaration=True)
 
         eprint("Finished parsing " + str(len(result_staffs)) + " staves")
@@ -230,13 +375,16 @@ def process_image(
         debug.clean_debug_files_from_previous_runs()
 
         eprint("Result was written to", xml_file)
-    except:
+        exit_status = "ok"
+    except BaseException as ex:
+        exit_status = f"exception: {ex}"
         if os.path.exists(xml_file):
             os.remove(xml_file)
         raise
     finally:
         if debug_cleanup is not None:
             debug_cleanup.clean_debug_files_from_previous_runs()
+        EXPORT.finish(exit_status)
     return xml_file
 
 
@@ -256,6 +404,11 @@ def detect_staffs_in_image(
     debug.write_bounding_boxes_alternating_colors("notehead_with_stems", noteheads_with_stems)
     eprint("Found " + str(len(noteheads_with_stems)) + " noteheads")
     if len(noteheads_with_stems) == 0:
+        _export_candidates(
+            staff_fragments=symbols.staff_fragments,
+            noteheads_with_stems=0,
+            failure="No noteheads found",
+        )
         raise Exception("No noteheads found")
 
     average_note_head_height = float(
@@ -281,6 +434,18 @@ def detect_staffs_in_image(
     staffs = detect_staff(
         debug, predictions.staff, symbols.staff_fragments, symbols.clefs_keys, bar_line_boxes
     )
+    _export_candidates(
+        staff_fragments=symbols.staff_fragments,
+        bar_line_boxes=bar_line_boxes,
+        clefs_keys=symbols.clefs_keys,
+        noteheads=[n.notehead for n in noteheads_with_stems],
+        stems=all_stems,
+        noteheads_with_stems=len(noteheads_with_stems),
+        average_note_head_height=average_note_head_height,
+        staffs_detected=_export_staffs(staffs) if EXPORT.on() else [],
+        failure=None if len(staffs) > 0 else "No staffs found",
+    )
+    EXPORT.stage("staff_detection", staffs=len(staffs))
     if len(staffs) == 0:
         raise Exception("No staffs found")
     if config.title_detection:
@@ -300,6 +465,17 @@ def detect_staffs_in_image(
     )
 
     multi_staffs = find_braces_brackets_and_grand_staff_lines(debug, staffs, brace_dot)
+    if EXPORT.on():
+        EXPORT.grouping_update(
+            {
+                "staffs_in": [EXPORT.staff_id(s) for s in staffs],
+                "brace_dot_boxes": [export.rotated(b) for b in brace_dot],
+                "multi_staffs": [[EXPORT.staff_id(s) for s in m.staffs] for m in multi_staffs],
+                "staffs_out": _export_staffs([s for m in multi_staffs for s in m.staffs]),
+            }
+        )
+        _export_geometry(multi_staffs, notes)
+        EXPORT.stage("grouping", systems=len(multi_staffs))
     eprint(
         "Found",
         len(multi_staffs),
@@ -451,8 +627,28 @@ def main() -> None:
     parser.add_argument(
         "--no-title", action="store_true", help="Don't detect title for faster inference"
     )
+    parser.add_argument(
+        "--export",
+        type=str,
+        default=None,
+        metavar="HOOKS",
+        help="Optionally export intermediate results next to the output, comma-separated: "
+        + "topk, scores, scores-full, geometry, staffdetect, grouping or all. "
+        + "Off by default; the MusicXML then only gains an id on every <note>.",
+    )
+    parser.add_argument(
+        "--export-top-k",
+        type=int,
+        default=5,
+        metavar="K",
+        help="Candidates per decoder head for --export topk (default 5)",
+    )
+    parser.add_argument(
+        "--export-dir", type=str, default=None, help="Directory for --export (default: next to the image)"
+    )
 
     args = parser.parse_args()
+    EXPORT.configure(args.export, args.export_top_k, args.export_dir)
 
     force_gpu = args.gpu == GpuSupport.FORCE
     auto_gpu = args.gpu == GpuSupport.AUTO

@@ -3,6 +3,7 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
+from homr.export import EXPORT
 from homr.onnx_providers import gpu_providers
 from homr.simple_logging import eprint
 from homr.transformer.configs import Config
@@ -142,6 +143,37 @@ class ScoreDecoder:
                 position=position_token[0],
                 coordinates=attention,
             )
+            if EXPORT.on():
+                symbol.export_id = EXPORT.token_id()
+                if EXPORT.wants_scores():
+                    EXPORT.record_token(
+                        symbol.export_id,
+                        {
+                            "rhythm": rhythm_token[0] if rhythm_token else "",
+                            "pitch": pitch_token[0] if pitch_token else "",
+                            "lift": lift_token[0] if lift_token else "",
+                            "articulation": articulation_token[0] if articulation_token else "",
+                            "slur": slur_token[0] if slur_token else "",
+                            "position": position_token[0] if position_token else "",
+                        },
+                        {
+                            "rhythm": rhythmsp[0, -1, :],
+                            "pitch": pitchsp[0, -1, :],
+                            "lift": liftsp[0, -1, :],
+                            "articulation": articulationsp[0, -1, :],
+                            "slur": slursp[0, -1, :],
+                            "position": positionsp[0, -1, :],
+                        },
+                        {
+                            "rhythm": self.inv_rhythm_vocab,
+                            "pitch": self.inv_pitch_vocab,
+                            "lift": self.inv_lift_vocab,
+                            "articulation": self.inv_articulation_vocab,
+                            "slur": self.inv_slur_vocab,
+                            "position": self.inv_position_vocab,
+                        },
+                        attention,
+                    )
             symbols.append(symbol)
 
             out_lift = np.concatenate((out_lift, lift_sample), axis=-1)

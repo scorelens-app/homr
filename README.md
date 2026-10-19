@@ -1,3 +1,23 @@
+> **This is a modified version of [homr](https://github.com/liebharc/homr)** by Christian Liebhardt and
+> contributors, based on upstream commit
+> [`e77c471`](https://github.com/liebharc/homr/commit/e77c4716d1893995aea63a8e9fb5f4ec52bf16c8).
+> It is distributed under the same license as the original, the
+> [GNU Affero General Public License v3.0](LICENSE). The model weights are upstream's, downloaded unchanged.
+>
+> **Changes from upstream** (`git diff e77c471 HEAD` shows the exact change):
+>
+> - 2026-10-19: optional export of intermediate results, `--export HOOKS` (comma-separated:
+>   `topk`, `scores`, `scores-full`, `geometry`, `staffdetect`, `grouping`, or `all`) with
+>   `--export-top-k K` and `--export-dir DIR`. Files go to `<image>.homr-export/`: `manifest.json`
+>   (inputs, model files, coordinate frames, stage status; written even when processing fails),
+>   `tokens.jsonl` (per decoded symbol: the top-k candidates of every decoder head with probabilities,
+>   the selected logit and log-normalizer, the attention point, what became of the token),
+>   `scores/*.npz` (raw score vectors), `geometry.json` (staffs, staff lines and symbol boxes),
+>   `staffdetect/` (segmentation maps before and after noise filtering, staff candidates) and
+>   `grouping.json` (staff grouping before and after). With `--export` each `<note>` in the MusicXML
+>   gets an `id` that `tokens.jsonl` refers to. Recognition itself is unchanged: decoding stays greedy,
+>   and without `--export` (the default) the output is byte-identical to upstream.
+
 # homr
 
 homr is an Optical Music Recognition (OMR) software designed to transform camera pictures or PDFs of sheet music into

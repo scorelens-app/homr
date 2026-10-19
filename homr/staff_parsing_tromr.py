@@ -1,3 +1,4 @@
+from homr.export import EXPORT
 from homr.model import Staff
 from homr.transformer.configs import Config
 from homr.transformer.staff2score import Staff2Score
@@ -19,4 +20,11 @@ def predict_best(org_image: NDArray, staff: Staff, config: Config) -> list[Encod
     result = inference.predict(org_image)
     if staff.is_grandstaff:
         return result
-    return [r for r in result if r.position != "lower"]
+    kept = [r for r in result if r.position != "lower"]
+    if EXPORT.on():
+        EXPORT.mark(
+            [r.export_id for r in result if r.position == "lower" and r.export_id],
+            "removed",
+            reason="lower_position_on_single_staff",
+        )
+    return kept

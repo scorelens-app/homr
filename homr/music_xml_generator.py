@@ -9,6 +9,7 @@ from fractions import Fraction
 import numpy as np
 
 from homr import constants
+from homr.export import EXPORT
 from homr.simple_logging import eprint
 from homr.transformer.vocabulary import (
     EncodedSymbol,
@@ -675,6 +676,8 @@ def build_note_or_rest(
     tuplet_mark: str,
 ) -> ET.Element:
     note = ET.Element("note")
+    if model_note.export_id is not None:
+        note.set("id", EXPORT.xml_note_id(model_note.export_id))
     if is_chord:
         ET.SubElement(note, "chord")
     model_pitch = model_note.pitch

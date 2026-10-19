@@ -5,6 +5,7 @@ import numpy as np
 
 from homr import constants
 from homr.debug import Debug
+from homr.export import EXPORT
 from homr.image_utils import crop_image_and_return_new_top
 from homr.model import MultiStaff, Staff
 from homr.simple_logging import eprint
@@ -340,7 +341,13 @@ def parse_staffs(
     Dewarps each staff and then runs it through an algorithm which extracts
     the rhythm and pitch information.
     """
+    before = [[EXPORT.staff_id(s) for s in m.staffs] for m in staffs] if EXPORT.on() else []
     staffs = _ensure_same_number_of_staffs(staffs)
+    if EXPORT.on():
+        after = [[EXPORT.staff_id(s) for s in m.staffs] for m in staffs]
+        EXPORT.grouping_update(
+            {"ensure_same_number": {"before": before, "after": after, "changed": before != after}}
+        )
     # For simplicity we call every staff in a multi staff a voice,
     # even if it's part of a grand staff.
     number_of_voices = _get_number_of_voices(staffs)
@@ -355,6 +362,9 @@ def parse_staffs(
                 eprint("Ignoring staff due to selected_staff argument", i)
                 i += 1
                 continue
+            if EXPORT.on():
+                EXPORT.start_run(i)
+                EXPORT.decode_order(i, EXPORT.staff_id(staff), voice)
             result_staff = parse_staff_image(debug, i, staff, image, regions, config)
             if len(result_staff) == 0:
                 eprint("Skipping empty staff", i)
@@ -364,5 +374,13 @@ def parse_staffs(
             result_for_voice.extend(result_staff)
             i += 1
 
-        voices.append(remove_duplicated_symbols(result_for_voice))
+        deduplicated = remove_duplicated_symbols(result_for_voice)
+        if EXPORT.on():
+            kept = {s.export_id for s in deduplicated if s.export_id}
+            EXPORT.mark(
+                [s.export_id for s in result_for_voice if s.export_id and s.export_id not in kept],
+                "removed",
+                reason="remove_duplicated_symbols",
+            )
+        voices.append(deduplicated)
     return voices
