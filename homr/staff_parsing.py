@@ -235,6 +235,7 @@ def _calculate_region(staff: Staff, regions: StaffRegions) -> NDArray:
 def prepare_staff_image(
     debug: Debug, index: int, staff: Staff, staff_image: NDArray, regions: StaffRegions
 ) -> tuple[NDArray, Staff]:
+    export_staff_id = EXPORT.staff_id(staff) if EXPORT.on("geometry") else ""
     region = _calculate_region(staff, regions)
     image_dimensions = get_tr_omr_canvas_size(
         (int(region[3] - region[1]), int(region[2] - region[0]))
@@ -261,6 +262,28 @@ def prepare_staff_image(
     staff_image = remove_black_contours_at_edges_of_image(staff_image, staff.average_unit_size)
     staff_image = center_image_on_canvas(staff_image, image_dimensions)
     debug.write_image_with_fixed_suffix(f"_staff-{index}_input.jpg", staff_image)
+    if EXPORT.on("geometry"):
+        # The same transformation the debug image below uses; recorded, not used.
+        exported = _dewarp_staff(staff, dewarp, top_left, scaling_factor)
+        y_offset = (tr_omr_max_height - int(image_dimensions[1])) // 2
+        EXPORT.add_canvas(
+            {
+                "staff_index": index,
+                "staff": export_staff_id,
+                "width": tr_omr_max_width,
+                "height": tr_omr_max_height,
+                "y_offset": y_offset,
+                "symbols": [
+                    {
+                        "id": f"{export_staff_id}.{k}",
+                        "kind": type(symbol).__name__,
+                        "cx": round(float(symbol.center[0]), 2),
+                        "cy": round(float(symbol.center[1]), 2),
+                    }
+                    for k, symbol in enumerate(exported.symbols)
+                ],
+            }
+        )
     if debug.debug:
         transformed_staff = _dewarp_staff(staff, dewarp, top_left, scaling_factor)
         transformed_staff_image = staff_image.copy()

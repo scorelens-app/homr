@@ -15,7 +15,7 @@
 >   `scores/*.npz` (raw score vectors), `geometry.json` (staffs, staff lines and symbol boxes),
 >   `staffdetect/` (segmentation maps before and after noise filtering, staff candidates) and
 >   `grouping.json` (staff grouping before and after). With `--export` each `<note>` in the MusicXML
->   gets an `id` that `tokens.jsonl` refers to. Recognition itself is unchanged: decoding stays greedy,
+>   gets an `id` that `tokens.jsonl` refers to. `geometry.json` also lists the detected bar lines (per staff, homr's own staff-zone test) and each staff's symbols in the transformer's input canvas, the frame of the attention points. Recognition itself is unchanged: decoding stays greedy,
 >   and without `--export` (the default) the output is byte-identical to upstream.
 
 # homr

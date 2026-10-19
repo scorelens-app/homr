@@ -202,18 +202,42 @@ def _export_staffs(staffs: list[Staff]) -> list[dict[str, object]]:
     ]
 
 
-def _export_geometry(multi_staffs: list[MultiStaff], notes: list[object]) -> None:
+def _export_geometry(
+    multi_staffs: list[MultiStaff],
+    notes: list[object],
+    bar_line_boxes: list[RotatedBoundingBox] | None = None,
+) -> None:
     if not EXPORT.on("geometry"):
         return
     staffs = []
+    bar_line_staffs: list[list[str]] = [[] for _ in bar_line_boxes or []]
+    bar_lines = [
+        {
+            "id": f"b{k}",
+            "box": export.rotated(b),
+            "x": round(float(b.center[0]), 2),
+            "staffs": bar_line_staffs[k],
+        }
+        for k, b in enumerate(bar_line_boxes or [])
+    ]
     for system, multi in enumerate(multi_staffs):
         for k, staff in enumerate(multi.staffs):
             entry = _export_staffs([staff])[0]
             entry["system"] = system
             entry["index_in_system"] = k
             symbols = []
-            for symbol in staff.symbols:
-                item: dict[str, object] = {"kind": type(symbol).__name__}
+            bar_line_ids = []
+            # homr's own staff-zone test (the one it applies to noteheads)
+            for k_bar, bar_box in enumerate(bar_line_boxes or []):
+                if staff.is_on_staff_zone(bar_box):
+                    bar_line_ids.append(f"b{k_bar}")
+                    bar_line_staffs[k_bar].append(str(entry["id"]))
+            entry["bar_line_ids"] = bar_line_ids
+            for k_symbol, symbol in enumerate(staff.symbols):
+                item: dict[str, object] = {
+                    "id": f"{entry['id']}.{k_symbol}",
+                    "kind": type(symbol).__name__,
+                }
                 box = getattr(symbol, "box", None)
                 item["box"] = export.rotated(box)
                 for attr in ("position", "has_dot"):
@@ -228,12 +252,12 @@ def _export_geometry(multi_staffs: list[MultiStaff], notes: list[object]) -> Non
                 symbols.append(item)
             entry["symbols"] = symbols
             staffs.append(entry)
-    EXPORT.write_json(
-        "geometry",
-        "geometry.json",
+    EXPORT.set_geometry(
         {
             "frame": "work",
             "staffs": staffs,
+            "bar_lines": bar_lines,
+            "canvas": [],
             "connections": [
                 [export.rotated(c) for c in multi.connections] for multi in multi_staffs
             ],
@@ -474,7 +498,7 @@ def detect_staffs_in_image(
                 "staffs_out": _export_staffs([s for m in multi_staffs for s in m.staffs]),
             }
         )
-        _export_geometry(multi_staffs, notes)
+        _export_geometry(multi_staffs, notes, bar_line_boxes)
         EXPORT.stage("grouping", systems=len(multi_staffs))
     eprint(
         "Found",

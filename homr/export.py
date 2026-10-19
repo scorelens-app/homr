@@ -39,6 +39,7 @@ class _Exporter:
         self._staff_refs: list[Any] = []
         self.grouping: dict[str, Any] = {}
         self.decode: list[dict[str, Any]] = []
+        self.geometry: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ setup
 
@@ -77,6 +78,7 @@ class _Exporter:
         self._staff_refs = []
         self.grouping = {}
         self.decode = []
+        self.geometry = None
         self.staff_index = -1
         self.run_index = 0
         self._started = time.monotonic()
@@ -269,6 +271,19 @@ class _Exporter:
             self._staff_ids[key] = f"s{len(self._staff_ids)}"
             self._staff_refs.append(staff)  # keep alive so id() stays unique
         return self._staff_ids[key]
+
+    def set_geometry(self, value: dict[str, Any]) -> None:
+        if not self.on("geometry"):
+            return
+        self.geometry = value
+        self.write_json("geometry", "geometry.json", value)
+
+    def add_canvas(self, entry: dict[str, Any]) -> None:
+        """The staff's symbols in the transformer's input canvas (same frame as attention_xy)."""
+        if not self.on("geometry") or self.geometry is None:
+            return
+        self.geometry.setdefault("canvas", []).append(entry)
+        self.write_json("geometry", "geometry.json", self.geometry)
 
     def decode_order(self, index: int, staff: str, voice: int) -> None:
         self.decode.append({"staff_index": index, "staff": staff, "voice": voice})
