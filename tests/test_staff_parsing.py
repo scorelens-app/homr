@@ -1,7 +1,17 @@
 import unittest
+from unittest import mock
 
+import cv2
+import numpy as np
+
+from homr import staff_parsing
 from homr.model import MultiStaff, Staff, StaffPoint
-from homr.staff_parsing import _ensure_same_number_of_staffs, _get_number_of_voices
+from homr.staff_parsing import (
+    _ensure_same_number_of_staffs,
+    _get_number_of_voices,
+    center_image_on_canvas,
+    parse_staff_image,
+)
 
 
 def make_staff(number: int, is_grandstaff: bool = False) -> Staff:
@@ -108,3 +118,29 @@ class TestStaffParsing(unittest.TestCase):
         )
         for row in result:
             self.assertEqual(1, len(row.staffs))
+
+
+class TestEmptyStaffAfterDewarping(unittest.TestCase):
+    """
+    On a tilted photo the staff region can be empty after dewarping. cv2.resize then fails
+    and, without the guard, the exception ended the whole page.
+    """
+
+    def _empty_crop_error(self, *_args: object, **_kwargs: object) -> None:
+        # What prepare_staff_image runs into: an empty crop centered on the canvas
+        center_image_on_canvas(np.zeros((0, 40), dtype=np.uint8), np.array([1280, 100]))
+
+    def test_resize_of_an_empty_crop_fails(self) -> None:
+        with self.assertRaises(cv2.error):
+            self._empty_crop_error()
+
+    def test_staff_with_empty_region_is_skipped(self) -> None:
+        with (
+            mock.patch.object(staff_parsing, "prepare_staff_image", self._empty_crop_error),
+            mock.patch.object(staff_parsing, "parse_staff_tromr") as tromr,
+        ):
+            result = parse_staff_image(
+                mock.Mock(), 3, make_staff(0), np.zeros((10, 10)), mock.Mock(), mock.Mock()
+            )
+        self.assertEqual([], result)
+        tromr.assert_not_called()
