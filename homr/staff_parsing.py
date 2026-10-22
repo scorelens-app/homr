@@ -328,9 +328,15 @@ def _dewarp_staff(
 def parse_staff_image(
     debug: Debug, index: int, staff: Staff, image: NDArray, regions: StaffRegions, config: Config
 ) -> list[EncodedSymbol]:
-    staff_image, transformed_staff = prepare_staff_image(
-        debug, index, staff, image, regions=regions
-    )
+    try:
+        staff_image, transformed_staff = prepare_staff_image(
+            debug, index, staff, image, regions=regions
+        )
+    except (cv2.error, ValueError) as e:
+        # On a tilted photo the staff region can be empty after dewarping, and cv2.resize
+        # fails on it. Skip this staff instead of losing the whole page.
+        eprint("Skipping staff", index, "whose dewarped region is empty:", str(e)[:80])
+        return []
     eprint("Running TrOmr inference on staff image", index)
     result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
     if debug.debug:

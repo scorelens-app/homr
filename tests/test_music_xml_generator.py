@@ -396,3 +396,17 @@ barline . . . . ."""
         self.assertEqual(_tieds(xml), ["start", "stop"])
         # the outer slur is untouched
         self.assertEqual(_slurs(xml), ["start", "stop"])
+
+    def test_grace_note_without_pitch_is_skipped(self) -> None:
+        # Ported from upstream liebharc/homr e5e17cc: a grace note without pitch was treated as a
+        # rest which takes no time and failed an assertion, so the whole page had no result.
+        tokens = read_token_lines(
+            """clef_G2 _ _ _ _ upper
+timeSignature/4 . . . . .
+note_8G . _ _ _ upper
+note_2 C5 _ _ _ upper
+barline . . . . .""".splitlines()
+        )
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        pitched = [_pitch(n) for n in _notes(_first_measure(xml)) if n.find("pitch") is not None]
+        self.assertEqual(pitched, ["C"])
