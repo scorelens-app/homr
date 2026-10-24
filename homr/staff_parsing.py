@@ -278,7 +278,9 @@ def prepare_staff_image(
                         "id": f"{export_staff_id}.{k}",
                         "kind": type(symbol).__name__,
                         "cx": round(float(symbol.center[0]), 2),
-                        "cy": round(float(symbol.center[1]), 2),
+                        # center_image_on_canvas pads the staff image by y_offset at the top:
+                        # the canvas frame (attention_xy) includes it.
+                        "cy": round(float(symbol.center[1]) + y_offset, 2),
                     }
                     for k, symbol in enumerate(exported.symbols)
                 ],
