@@ -3,6 +3,7 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
+from homr.decode_hook import DECODE_HOOK
 from homr.export import EXPORT
 from homr.onnx_providers import gpu_providers
 from homr.simple_logging import eprint
@@ -59,6 +60,9 @@ class ScoreDecoder:
 
         if num_dims == 1:
             start_tokens = start_tokens[None, :]
+
+        if DECODE_HOOK.staff(self.inv_rhythm_vocab):
+            return self._generate_hooked(start_tokens, nonote_tokens, kwargs["context"])
 
         b, t = start_tokens.shape
 
@@ -182,6 +186,173 @@ class ScoreDecoder:
             out_articulations = np.concatenate((out_articulations, articulation_sample), axis=-1)
             out_slurs = np.concatenate((out_slurs, slur_sample), axis=-1)
 
+        return symbols
+
+    def _step(
+        self, tokens: list[NDArray], cache: list[Any], context: NDArray, step: int
+    ) -> tuple[list[NDArray], NDArray, list[Any]]:
+        """One decoder step for one hypothesis: (head outputs, attention, new cache)."""
+        names = ["rhythms", "pitchs", "lifts", "articulations", "slurs"]
+        for name, token in zip(names, tokens, strict=True):
+            self.io_binding.bind_cpu_input(name, token)
+        self.io_binding.bind_cpu_input("context", context)
+        self.io_binding.bind_cpu_input("cache_len", np.array([step], dtype=np.int64))
+        _, kv_input_names, kv_output_names = self._kv_names()
+        for name, cache_val in zip(kv_input_names, cache, strict=True):
+            self.io_binding.bind_ortvalue_input(name, cache_val)
+        for name in self.output_names + kv_output_names:
+            self.io_binding.bind_output(name, self.device, self.device_id)
+        self.net.run_with_iobinding(iobinding=self.io_binding)
+        outputs = self.io_binding.get_outputs()
+        heads = [outputs[i].numpy() for i in range(6)]
+        return heads, outputs[6].numpy(), outputs[7:]
+
+    def _kv_names(self) -> tuple[None, list[str], list[str]]:
+        n = self.config.decoder_depth * 4
+        return None, [f"cache_in{i}" for i in range(n)], [f"cache_out{i}" for i in range(n)]
+
+    def _generate_hooked(  # noqa: C901, PLR0912, PLR0915
+        self, start_tokens: NDArray, nonote_tokens: NDArray, full_context: NDArray
+    ) -> list[EncodedSymbol]:
+        """Beam search over the rhythm head, re-weighted by the external decode hook
+        (homr/decode_hook.py). The other heads stay greedy within each hypothesis."""
+        width = DECODE_HOOK.beam_width
+        top_k = DECODE_HOOK.top_k
+        cache, _, _ = self.init_cache()
+        context_reduced = full_context[:, :1]
+        next_id = 1
+        # A hypothesis: id, parent, last rhythm token, score, input tokens, cache, symbols, records
+        beams: list[dict[str, Any]] = [
+            {
+                "id": 0,
+                "parent": -1,
+                "tok": None,
+                "score": 0.0,
+                "tokens": [start_tokens, nonote_tokens, nonote_tokens, nonote_tokens, nonote_tokens],
+                "cache": cache,
+                "symbols": [],
+            }
+        ]
+        finished: list[dict[str, Any]] = []
+        for step in range(self.max_seq_len):
+            context = full_context if step == 0 else context_reduced
+            evaluated = []
+            for beam in beams:
+                heads, attention, new_cache = self._step(beam["tokens"], beam["cache"], context, step)
+                logits = heads[0][0, -1, :].astype(np.float64)
+                logp = logits - (np.log(np.exp(logits - logits.max()).sum()) + logits.max())
+                top = np.argsort(-logp)[:top_k]
+                evaluated.append((beam, heads, attention, new_cache, logp, top))
+            message = [
+                {
+                    "id": beam["id"],
+                    "parent": beam["parent"],
+                    "tok": beam["tok"],
+                    "top": [[int(t), round(float(logp[t]), 4)] for t in top],
+                }
+                for beam, _, _, _, logp, top in evaluated
+            ]
+            answer = DECODE_HOOK.step(step, message)
+            candidates = []
+            for index, (beam, _, _, _, logp, top) in enumerate(evaluated):
+                expand = (answer or {}).get(beam["id"]) or [(int(top[0]), 0.0)]
+                if answer is None:
+                    expand = [(int(top[0]), 0.0)]
+                for tok, adj in expand:
+                    if not 0 <= tok < len(logp) or adj == float("-inf"):
+                        continue
+                    candidates.append((beam["score"] + float(logp[tok]) + adj, index, tok))
+            if not candidates:
+                # The hook ruled out everything: fall back to the best token of the best beam.
+                beam, _, _, _, logp, top = evaluated[0]
+                candidates.append((beam["score"] + float(logp[top[0]]), 0, int(top[0])))
+            candidates.sort(key=lambda c: -c[0])
+            new_beams: list[dict[str, Any]] = []
+            for score, index, tok in candidates:
+                if len(new_beams) >= width:
+                    break
+                beam, heads, attention, new_cache, _, _ = evaluated[index]
+                if tok == self.eos_token:
+                    finished.append({**beam, "score": score, "end_tok": tok})
+                    continue
+                samples = [np.array([[tok]])] + [
+                    np.array([[heads[h][:, -1, :].argmax()]]) for h in (1, 2, 4, 5)
+                ]
+                position_sample = np.array([[heads[3][:, -1, :].argmax()]])
+                rhythm_token = detokenize(samples[0], self.inv_rhythm_vocab)
+                pitch_token = detokenize(samples[1], self.inv_pitch_vocab)
+                lift_token = detokenize(samples[2], self.inv_lift_vocab)
+                articulation_token = detokenize(samples[3], self.inv_articulation_vocab)
+                slur_token = detokenize(samples[4], self.inv_slur_vocab)
+                position_token = detokenize(position_sample, self.inv_position_vocab)
+                symbol = EncodedSymbol(
+                    rhythm=rhythm_token[0],
+                    pitch=pitch_token[0],
+                    lift=lift_token[0],
+                    articulation=articulation_token[0],
+                    slur=slur_token[0],
+                    position=position_token[0],
+                    coordinates=attention,
+                )
+                record = None
+                if EXPORT.on() and EXPORT.wants_scores():
+                    record = (
+                        {
+                            "rhythm": rhythm_token[0] if rhythm_token else "",
+                            "pitch": pitch_token[0] if pitch_token else "",
+                            "lift": lift_token[0] if lift_token else "",
+                            "articulation": articulation_token[0] if articulation_token else "",
+                            "slur": slur_token[0] if slur_token else "",
+                            "position": position_token[0] if position_token else "",
+                        },
+                        {
+                            "rhythm": heads[0][0, -1, :],
+                            "pitch": heads[1][0, -1, :],
+                            "lift": heads[2][0, -1, :],
+                            "articulation": heads[4][0, -1, :],
+                            "slur": heads[5][0, -1, :],
+                            "position": heads[3][0, -1, :],
+                        },
+                        attention,
+                    )
+                tokens = [samples[0], samples[1], samples[2], samples[3], samples[4]]
+                new_beams.append(
+                    {
+                        "id": next_id,
+                        "parent": beam["id"],
+                        "tok": tok,
+                        "score": score,
+                        "tokens": tokens,
+                        "cache": new_cache,
+                        "symbols": [*beam["symbols"], (symbol, record)],
+                    }
+                )
+                next_id += 1
+            # Stop once the best finished hypothesis beats every live one.
+            if finished:
+                best_finished = max(b["score"] for b in finished)
+                new_beams = [b for b in new_beams if b["score"] > best_finished]
+            beams = new_beams
+            if not beams:
+                break
+        pool = finished or beams
+        best = max(pool, key=lambda b: b["score"])
+        DECODE_HOOK.end(best["id"], best.get("end_tok", best["tok"]))
+        vocabs = {
+            "rhythm": self.inv_rhythm_vocab,
+            "pitch": self.inv_pitch_vocab,
+            "lift": self.inv_lift_vocab,
+            "articulation": self.inv_articulation_vocab,
+            "slur": self.inv_slur_vocab,
+            "position": self.inv_position_vocab,
+        }
+        symbols: list[EncodedSymbol] = []
+        for symbol, record in best["symbols"]:
+            if EXPORT.on():
+                symbol.export_id = EXPORT.token_id()
+                if record is not None:
+                    EXPORT.record_token(symbol.export_id, record[0], record[1], vocabs, record[2])
+            symbols.append(symbol)
         return symbols
 
     def init_cache(self, cache_len: int = 0) -> tuple[list[NDArray], list[str], list[str]]:

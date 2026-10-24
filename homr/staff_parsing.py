@@ -5,6 +5,7 @@ import numpy as np
 
 from homr import constants
 from homr.debug import Debug
+from homr.decode_hook import DECODE_HOOK
 from homr.export import EXPORT
 from homr.image_utils import crop_image_and_return_new_top
 from homr.model import MultiStaff, Staff
@@ -394,6 +395,7 @@ def parse_staffs(
             if EXPORT.on():
                 EXPORT.start_run(i)
                 EXPORT.decode_order(i, EXPORT.staff_id(staff), voice)
+            DECODE_HOOK.begin_staff(i, voice, staff.is_grandstaff)
             result_staff = parse_staff_image(debug, i, staff, image, regions, config)
             if len(result_staff) == 0:
                 eprint("Skipping empty staff", i)

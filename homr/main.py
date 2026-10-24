@@ -29,6 +29,7 @@ from homr.brace_dot_detection import (
 )
 from homr import export
 from homr.debug import Debug
+from homr.decode_hook import DECODE_HOOK
 from homr.export import EXPORT
 from homr.model import InputPredictions, MultiStaff, Staff
 from homr.music_xml_generator import XmlGeneratorArguments, generate_xml
@@ -671,8 +672,32 @@ def main() -> None:
         "--export-dir", type=str, default=None, help="Directory for --export (default: next to the image)"
     )
 
+    parser.add_argument(
+        "--decode-hook",
+        type=str,
+        default=None,
+        metavar="CMD",
+        help="Optional external process that re-weights the rhythm head while decoding "
+        + "(JSON lines over stdin/stdout, see homr/decode_hook.py). Off by default.",
+    )
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Hypotheses kept per step when --decode-hook is set (default 1)",
+    )
+    parser.add_argument(
+        "--decode-hook-top-k",
+        type=int,
+        default=8,
+        metavar="K",
+        help="Rhythm candidates per step sent to the decode hook (default 8)",
+    )
+
     args = parser.parse_args()
     EXPORT.configure(args.export, args.export_top_k, args.export_dir)
+    DECODE_HOOK.configure(args.decode_hook, args.beam_width, args.decode_hook_top_k)
 
     force_gpu = args.gpu == GpuSupport.FORCE
     auto_gpu = args.gpu == GpuSupport.AUTO
