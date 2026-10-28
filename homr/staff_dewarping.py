@@ -62,21 +62,39 @@ class DelaunayTriangulation:
         return None
 
     def find_simplex(self, points: NDArray) -> NDArray:
-        """Find which triangle contains each point"""
+        """Find which triangle contains each point (the first one, in simplex order)"""
         if self.simplices is None:
             return np.full(len(points), -1, dtype=np.int32)
 
         points = np.atleast_2d(points)
         result = np.full(len(points), -1, dtype=np.int32)
+        if len(self.simplices) == 0:
+            return result
 
         for i, point in enumerate(points):
-            for j, simplex in enumerate(self.simplices):
-                triangle = self.points[simplex]
-                if self._point_in_triangle(point, triangle):
-                    result[i] = j
-                    break
+            inside = np.flatnonzero(self._points_in_triangles(point))
+            if len(inside) > 0:
+                result[i] = inside[0]
 
         return result
+
+    def _points_in_triangles(self, point: NDArray) -> NDArray:
+        """_point_in_triangle against every simplex at once: the same float operations, in
+        the same order and dtype, element by element, so the same answer for each."""
+        if not hasattr(self, "_corners"):
+            triangles = self.points[self.simplices]
+            x0, y0 = triangles[:, 0, 0], triangles[:, 0, 1]
+            x1, y1 = triangles[:, 1, 0], triangles[:, 1, 1]
+            x2, y2 = triangles[:, 2, 0], triangles[:, 2, 1]
+            denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+            self._corners = (x0, y0, x1, y1, x2, y2, denom, np.abs(denom) < 1e-10)
+        x0, y0, x1, y1, x2, y2, denom, degenerate = self._corners
+        x, y = point
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a = ((y1 - y2) * (x - x2) + (x2 - x1) * (y - y2)) / denom
+            b = ((y2 - y0) * (x - x2) + (x0 - x2) * (y - y2)) / denom
+        c = 1 - a - b
+        return ~degenerate & (a >= -1e-10) & (b >= -1e-10) & (c >= -1e-10)
 
     def _point_in_triangle(self, point: NDArray, triangle: NDArray) -> bool:
         """Check if point is inside triangle using barycentric coordinates"""

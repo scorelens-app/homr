@@ -43,6 +43,7 @@ class _Exporter:
         self.grouping: dict[str, Any] = {}
         self.decode: list[dict[str, Any]] = []
         self.geometry: dict[str, Any] | None = None
+        self._geometry_dirty = False
         # Decoder state of a staff decoded on a worker thread (staff_parsing with
         # HOMR_STAFF_WORKERS > 1): its tokens are kept apart and merged in staff order.
         self._local = threading.local()
@@ -85,6 +86,7 @@ class _Exporter:
         self.grouping = {}
         self.decode = []
         self.geometry = None
+        self._geometry_dirty = False
         self.staff_index = -1
         self.run_index = 0
         self._started = time.monotonic()
@@ -137,6 +139,9 @@ class _Exporter:
     def finish(self, exit_status: str) -> None:
         if not self.hooks or self.dir is None:
             return
+        if self._geometry_dirty and self.geometry is not None:
+            self.write_json("geometry", "geometry.json", self.geometry)
+        self._geometry_dirty = False
         for token in self.tokens:
             ids = self.xml_map.get(token["id"])
             if ids:
@@ -319,6 +324,7 @@ class _Exporter:
         if not self.on("geometry"):
             return
         self.geometry = value
+        self._geometry_dirty = False
         self.write_json("geometry", "geometry.json", value)
 
     def add_canvas(self, entry: dict[str, Any]) -> None:
@@ -326,7 +332,9 @@ class _Exporter:
         if not self.on("geometry") or self.geometry is None:
             return
         self.geometry.setdefault("canvas", []).append(entry)
-        self.write_json("geometry", "geometry.json", self.geometry)
+        # Written once in finish() (the file grows with every staff; rewriting it per staff
+        # cost about a second a page). Same bytes in the end.
+        self._geometry_dirty = True
 
     def decode_order(self, index: int, staff: str, voice: int) -> None:
         self.decode.append({"staff_index": index, "staff": staff, "voice": voice})
