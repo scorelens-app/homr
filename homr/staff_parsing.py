@@ -1,4 +1,6 @@
 import math
+import os
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -11,7 +13,7 @@ from homr.image_utils import crop_image_and_return_new_top
 from homr.model import MultiStaff, Staff
 from homr.simple_logging import eprint
 from homr.staff_dewarping import StaffDewarping, dewarp_staff_image
-from homr.staff_parsing_tromr import parse_staff_tromr
+from homr.staff_parsing_tromr import load_model, parse_staff_tromr
 from homr.staff_regions import StaffRegions
 from homr.transformer.configs import Config, default_config
 from homr.transformer.vocabulary import EncodedSymbol, remove_duplicated_symbols
@@ -329,16 +331,28 @@ def _dewarp_staff(
 def parse_staff_image(
     debug: Debug, index: int, staff: Staff, image: NDArray, regions: StaffRegions, config: Config
 ) -> list[EncodedSymbol]:
+    prepared = _prepare_or_skip(debug, index, staff, image, regions)
+    if prepared is None:
+        return []
+    eprint("Running TrOmr inference on staff image", index)
+    return _decode_staff(debug, index, *prepared, config)
+
+
+def _prepare_or_skip(
+    debug: Debug, index: int, staff: Staff, image: NDArray, regions: StaffRegions
+) -> tuple[NDArray, Staff] | None:
     try:
-        staff_image, transformed_staff = prepare_staff_image(
-            debug, index, staff, image, regions=regions
-        )
+        return prepare_staff_image(debug, index, staff, image, regions=regions)
     except (cv2.error, ValueError) as e:
         # On a tilted photo the staff region can be empty after dewarping, and cv2.resize
         # fails on it. Skip this staff instead of losing the whole page.
         eprint("Skipping staff", index, "whose dewarped region is empty:", str(e)[:80])
-        return []
-    eprint("Running TrOmr inference on staff image", index)
+        return None
+
+
+def _decode_staff(
+    debug: Debug, index: int, staff_image: NDArray, transformed_staff: Staff, config: Config
+) -> list[EncodedSymbol]:
     result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
     if debug.debug:
         result_image = staff_image.copy()
@@ -364,6 +378,18 @@ def parse_staff_image(
     return result
 
 
+def staff_workers() -> int:
+    """How many staves are decoded at once (``HOMR_STAFF_WORKERS``, default 1).
+
+    The transformer decodes one token at a time, which keeps only a core or two
+    busy; with several workers the staves of a page run side by side on one shared
+    model. The result is the same as with one worker: every staff is decoded alone,
+    and the staves are put together in page order.
+    """
+    value = os.environ.get("HOMR_STAFF_WORKERS", "").strip()
+    return max(1, int(value)) if value.isdigit() else 1
+
+
 def parse_staffs(
     debug: Debug, staffs: list[MultiStaff], image: NDArray, config: Config, selected_staff: int = -1
 ) -> list[list[EncodedSymbol]]:
@@ -381,9 +407,16 @@ def parse_staffs(
     # For simplicity we call every staff in a multi staff a voice,
     # even if it's part of a grand staff.
     number_of_voices = _get_number_of_voices(staffs)
+    regions = StaffRegions(staffs)
+    workers = staff_workers()
+    if workers > 1:
+        load_model(config)  # once, before the threads share it
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return _parse_voices_pooled(
+                debug, staffs, image, config, selected_staff, number_of_voices, regions, pool
+            )
     i = 0
     voices = []
-    regions = StaffRegions(staffs)
     for voice in range(number_of_voices):
         staffs_for_voice = [staff.staffs[voice] for staff in staffs]
         result_for_voice = []
@@ -405,13 +438,79 @@ def parse_staffs(
             result_for_voice.extend(result_staff)
             i += 1
 
-        deduplicated = remove_duplicated_symbols(result_for_voice)
-        if EXPORT.on():
-            kept = {s.export_id for s in deduplicated if s.export_id}
-            EXPORT.mark(
-                [s.export_id for s in result_for_voice if s.export_id and s.export_id not in kept],
-                "removed",
-                reason="remove_duplicated_symbols",
-            )
-        voices.append(deduplicated)
+        voices.append(_deduplicate(result_for_voice))
     return voices
+
+
+def _deduplicate(result_for_voice: list[EncodedSymbol]) -> list[EncodedSymbol]:
+    deduplicated = remove_duplicated_symbols(result_for_voice)
+    if EXPORT.on():
+        kept = {s.export_id for s in deduplicated if s.export_id}
+        EXPORT.mark(
+            [s.export_id for s in result_for_voice if s.export_id and s.export_id not in kept],
+            "removed",
+            reason="remove_duplicated_symbols",
+        )
+    return deduplicated
+
+
+def _parse_voices_pooled(  # noqa: PLR0913
+    debug: Debug,
+    staffs: list[MultiStaff],
+    image: NDArray,
+    config: Config,
+    selected_staff: int,
+    number_of_voices: int,
+    regions: StaffRegions,
+    pool: ThreadPoolExecutor,
+) -> list[list[EncodedSymbol]]:
+    # Every staff is prepared here, in page order; with a pool its decoding starts at
+    # once on a worker while the next staff is prepared, and the results are taken
+    # back in page order below.
+    i = 0
+    planned: list[list[tuple[int, Future[tuple[list[EncodedSymbol], object]] | list[EncodedSymbol]]]] = []
+    for voice in range(number_of_voices):
+        staffs_for_voice = [staff.staffs[voice] for staff in staffs]
+        planned_for_voice = []
+        for staff_index, staff in enumerate(staffs_for_voice):
+            if selected_staff >= 0 and staff_index != selected_staff:
+                eprint("Ignoring staff due to selected_staff argument", i)
+                i += 1
+                continue
+            run = EXPORT.detached_run(i)
+            if EXPORT.on():
+                EXPORT.decode_order(i, EXPORT.staff_id(staff), voice)
+            prepared = _prepare_or_skip(debug, i, staff, image, regions)
+            if prepared is None:
+                planned_for_voice.append((i, []))
+            else:
+                eprint("Running TrOmr inference on staff image", i)
+                planned_for_voice.append(
+                    (i, pool.submit(_decode_detached, run, debug, i, *prepared, config))
+                )
+            i += 1
+        planned.append(planned_for_voice)
+
+    voices = []
+    for planned_for_voice in planned:
+        result_for_voice = []
+        for index, planned_staff in planned_for_voice:
+            if isinstance(planned_staff, Future):
+                result_staff, run = planned_staff.result()
+                EXPORT.merge_run(run)
+            else:
+                result_staff = planned_staff
+            if len(result_staff) == 0:
+                eprint("Skipping empty staff", index)
+                continue
+            result_staff.append(EncodedSymbol("newline"))
+            result_for_voice.extend(result_staff)
+        voices.append(_deduplicate(result_for_voice))
+    return voices
+
+
+def _decode_detached(
+    run: object, debug: Debug, index: int, staff_image: NDArray, staff: Staff, config: Config
+) -> tuple[list[EncodedSymbol], object]:
+    with EXPORT.in_run(run):  # type: ignore[arg-type]
+        return _decode_staff(debug, index, staff_image, staff, config), run

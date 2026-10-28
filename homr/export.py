@@ -12,7 +12,10 @@ rewritten after every stage so that it is present even when homr fails.
 import hashlib
 import json
 import os
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
@@ -40,6 +43,9 @@ class _Exporter:
         self.grouping: dict[str, Any] = {}
         self.decode: list[dict[str, Any]] = []
         self.geometry: dict[str, Any] | None = None
+        # Decoder state of a staff decoded on a worker thread (staff_parsing with
+        # HOMR_STAFF_WORKERS > 1): its tokens are kept apart and merged in staff order.
+        self._local = threading.local()
 
     # ------------------------------------------------------------------ setup
 
@@ -197,9 +203,45 @@ class _Exporter:
             self.run_index += 1
         self.next_step = 0
 
+    def detached_run(self, staff_index: int) -> "_Run":
+        """start_run() for a staff that a worker thread decodes: the ids are the ones the
+        sequential order would give; the tokens stay in the returned run until merge_run()."""
+        self.start_run(staff_index)
+        return _Run(self.staff_index, self.run_index)
+
+    @contextmanager
+    def in_run(self, run: "_Run | None") -> Iterator[None]:
+        """Route this thread's token_id/record_token/mark to ``run``."""
+        self._local.run = run
+        try:
+            yield
+        finally:
+            self._local.run = None
+
+    def merge_run(self, run: "_Run") -> None:
+        """Append a detached run's tokens as if it had been decoded here, in this order."""
+        if not self.hooks:
+            return
+        self.tokens.extend(run.tokens)
+        for key, heads in run.full_scores.items():
+            store = self.full_scores.setdefault(key, {})
+            for head, rows in heads.items():
+                if head.startswith("vocab_"):
+                    store.setdefault(head, rows)
+                else:
+                    store.setdefault(head, []).extend(rows)
+        self.staff_index = run.staff_index
+        self.run_index = run.run_index
+        self.next_step = run.next_step
+
+    def _run(self) -> "_Exporter | _Run":
+        run = getattr(self._local, "run", None)
+        return self if run is None else run
+
     def token_id(self) -> str:
-        token = f"n{self.staff_index}-{self.run_index}-{self.next_step}"
-        self.next_step += 1
+        state = self._run()
+        token = f"n{state.staff_index}-{state.run_index}-{state.next_step}"
+        state.next_step += 1
         return token
 
     def wants_scores(self) -> bool:
@@ -214,7 +256,8 @@ class _Exporter:
         attention: Any,
     ) -> None:
         """heads: head name -> 1-D logits of this step."""
-        entry: dict[str, Any] = {"id": token_id, "staff": self.staff_index, "run": self.run_index}
+        state = self._run()
+        entry: dict[str, Any] = {"id": token_id, "staff": state.staff_index, "run": state.run_index}
         entry["step"] = int(token_id.rsplit("-", 1)[1])
         entry["selected"] = selected
         if self.on("topk"):
@@ -238,10 +281,10 @@ class _Exporter:
         if point is not None:
             entry["attention_xy"] = point
         entry["fate"] = "unknown"
-        self.tokens.append(entry)
+        state.tokens.append(entry)
         if self.on("scores-full"):
-            run = f"{self.staff_index}-{self.run_index}"
-            store = self.full_scores.setdefault(run, {})
+            run = f"{state.staff_index}-{state.run_index}"
+            store = state.full_scores.setdefault(run, {})
             for head, logits in heads.items():
                 store.setdefault(head, []).append(np.asarray(logits, dtype=np.float32).ravel())
                 if "vocab_" + head not in store:
@@ -251,7 +294,7 @@ class _Exporter:
         if not self.hooks:
             return
         wanted = set(token_ids)
-        for token in self.tokens:
+        for token in self._run().tokens:
             if token["id"] in wanted and token["fate"] == "unknown":
                 token["fate"] = fate
                 token.update(extra)
@@ -293,6 +336,17 @@ class _Exporter:
             return
         self.grouping.update(value)
         self.write_json("grouping", "grouping.json", self.grouping)
+
+
+class _Run:
+    """One staff's decoder state and tokens while a worker thread decodes it."""
+
+    def __init__(self, staff_index: int, run_index: int) -> None:
+        self.staff_index = staff_index
+        self.run_index = run_index
+        self.next_step = 0
+        self.tokens: list[dict[str, Any]] = []
+        self.full_scores: dict[str, dict[str, list[Any]]] = {}
 
 
 EXPORT = _Exporter()

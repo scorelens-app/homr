@@ -3,6 +3,7 @@ import onnxruntime as ort
 
 from homr.onnx_providers import (
     coreml_available,
+    cpu_session_options,
     coreml_mlprogram_providers,
     gpu_providers,
 )
@@ -62,21 +63,24 @@ class Encoder:
                 self.fp16 = False
 
         else:
-            self.encoder = ort.InferenceSession(config.filepaths.encoder_path)
+            self.encoder = ort.InferenceSession(
+                config.filepaths.encoder_path, sess_options=cpu_session_options()
+            )
             self.fp16 = False
 
-        self.io_binding = self.encoder.io_binding()
         self.device_id = 0
 
         self.input_name = self.encoder.get_inputs()[0].name
         self.output_name = self.encoder.get_outputs()[0].name
 
     def generate(self, x: NDArray) -> NDArray:
+        # A binding per call: staves may be encoded on several threads at once.
+        io_binding = self.encoder.io_binding()
         if self.fp16:
-            self.io_binding.bind_cpu_input("input", x.astype(np.float16))
+            io_binding.bind_cpu_input("input", x.astype(np.float16))
         else:
-            self.io_binding.bind_cpu_input("input", x.astype(np.float32))
+            io_binding.bind_cpu_input("input", x.astype(np.float32))
 
-        self.io_binding.bind_output("output", "cuda" if self.use_gpu else "cpu", self.device_id)
-        self.encoder.run_with_iobinding(self.io_binding)
-        return self.io_binding.get_outputs()[0].numpy()
+        io_binding.bind_output("output", "cuda" if self.use_gpu else "cpu", self.device_id)
+        self.encoder.run_with_iobinding(io_binding)
+        return io_binding.get_outputs()[0].numpy()

@@ -12,12 +12,16 @@ def parse_staff_tromr(staff: Staff, staff_image: NDArray, config: Config) -> lis
     return predict_best(staff_image, staff=staff, config=config)
 
 
-def predict_best(org_image: NDArray, staff: Staff, config: Config) -> list[EncodedSymbol]:
+def load_model(config: Config) -> Staff2Score:
+    """The transformer, loaded once per process (before any worker thread uses it)."""
     global inference  # noqa: PLW0603
     if inference is None:
         inference = Staff2Score(config)
+    return inference
 
-    result = inference.predict(org_image)
+
+def predict_best(org_image: NDArray, staff: Staff, config: Config) -> list[EncodedSymbol]:
+    result = load_model(config).predict(org_image)
     if staff.is_grandstaff:
         return result
     kept = [r for r in result if r.position != "lower"]

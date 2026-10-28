@@ -67,6 +67,20 @@ def coreml_mlprogram_providers(model_path: str, compute_units: str = "ALL") -> l
     return [("CoreMLExecutionProvider", options)]
 
 
+def cpu_session_options() -> ort.SessionOptions:
+    """Options for the transformer's CPU sessions.
+
+    ``HOMR_INTRA_OP_THREADS`` sets how many threads one inference may use (unset:
+    ONNX Runtime's default, one per physical core). With ``HOMR_STAFF_WORKERS`` > 1
+    several staves run at once, each on its own share of the cores.
+    """
+    options = ort.SessionOptions()
+    threads = os.environ.get("HOMR_INTRA_OP_THREADS", "").strip()
+    if threads.isdigit() and int(threads) > 0:
+        options.intra_op_num_threads = int(threads)
+    return options
+
+
 def cuda_available() -> bool:
     return "CUDAExecutionProvider" in ort.get_available_providers()
 

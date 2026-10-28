@@ -5,7 +5,7 @@ import onnxruntime as ort
 
 from homr.decode_hook import DECODE_HOOK
 from homr.export import EXPORT
-from homr.onnx_providers import gpu_providers
+from homr.onnx_providers import cpu_session_options, gpu_providers
 from homr.simple_logging import eprint
 from homr.transformer.configs import Config
 from homr.transformer.vocabulary import EncodedSymbol
@@ -25,7 +25,6 @@ class ScoreDecoder:
         self.ignore_index = ignore_index
         self.config = config
         self.net = transformer
-        self.io_binding = self.net.io_binding()
         self.max_seq_len = config.max_seq_len
         self.eos_token = config.eos_token
 
@@ -71,6 +70,8 @@ class ScoreDecoder:
         out_lift = nonote_tokens
         out_articulations = nonote_tokens
         out_slurs = nonote_tokens
+        # A binding per call: staves may be decoded on several threads at once.
+        io_binding = self.net.io_binding()
         cache, kv_input_names, kv_output_names = self.init_cache()
         output_names = self.output_names + kv_output_names
         context = kwargs["context"]
@@ -91,25 +92,25 @@ class ScoreDecoder:
             context = context if step == 0 else context_reduced
 
             # Bind Inputs
-            self.io_binding.bind_cpu_input("rhythms", x_rhythm)
-            self.io_binding.bind_cpu_input("pitchs", x_pitch)
-            self.io_binding.bind_cpu_input("lifts", x_lift)
-            self.io_binding.bind_cpu_input("articulations", x_articulations)
-            self.io_binding.bind_cpu_input("slurs", x_slurs)
-            self.io_binding.bind_cpu_input("context", context)
-            self.io_binding.bind_cpu_input("cache_len", np.array([step], dtype=np.int64))
+            io_binding.bind_cpu_input("rhythms", x_rhythm)
+            io_binding.bind_cpu_input("pitchs", x_pitch)
+            io_binding.bind_cpu_input("lifts", x_lift)
+            io_binding.bind_cpu_input("articulations", x_articulations)
+            io_binding.bind_cpu_input("slurs", x_slurs)
+            io_binding.bind_cpu_input("context", context)
+            io_binding.bind_cpu_input("cache_len", np.array([step], dtype=np.int64))
             for name, cache_val in zip(kv_input_names, cache, strict=True):
-                self.io_binding.bind_ortvalue_input(name, cache_val)
+                io_binding.bind_ortvalue_input(name, cache_val)
 
             # Bind Outputs
             for name in output_names:
-                self.io_binding.bind_output(name, self.device, self.device_id)
+                io_binding.bind_output(name, self.device, self.device_id)
 
             # Run inference
-            self.net.run_with_iobinding(iobinding=self.io_binding)
+            self.net.run_with_iobinding(iobinding=io_binding)
 
             # Get outputs
-            outputs = self.io_binding.get_outputs()
+            outputs = io_binding.get_outputs()
             cache = outputs[7:]
 
             # Greedy decoding: pick the highest logit directly for each output
@@ -424,7 +425,9 @@ def get_decoder(config: Config) -> ScoreDecoder:
             fp16 = True
 
     else:
-        onnx_transformer = ort.InferenceSession(config.filepaths.decoder_path)
+        onnx_transformer = ort.InferenceSession(
+            config.filepaths.decoder_path, sess_options=cpu_session_options()
+        )
         fp16 = False
 
     return ScoreDecoder(onnx_transformer, fp16, use_gpu, config=config)
