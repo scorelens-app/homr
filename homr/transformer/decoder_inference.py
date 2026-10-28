@@ -25,6 +25,9 @@ class ScoreDecoder:
         self.ignore_index = ignore_index
         self.config = config
         self.net = transformer
+        # The decode hook's beam search (sequential) binds here; the greedy decoder binds
+        # per call so that staves can be decoded on several threads at once.
+        self.io_binding = self.net.io_binding()
         self.max_seq_len = config.max_seq_len
         self.eos_token = config.eos_token
 
@@ -70,7 +73,6 @@ class ScoreDecoder:
         out_lift = nonote_tokens
         out_articulations = nonote_tokens
         out_slurs = nonote_tokens
-        # A binding per call: staves may be decoded on several threads at once.
         io_binding = self.net.io_binding()
         cache, kv_input_names, kv_output_names = self.init_cache()
         output_names = self.output_names + kv_output_names

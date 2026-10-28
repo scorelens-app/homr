@@ -408,7 +408,8 @@ def parse_staffs(
     # even if it's part of a grand staff.
     number_of_voices = _get_number_of_voices(staffs)
     regions = StaffRegions(staffs)
-    workers = staff_workers()
+    # The decode hook talks to one external process staff by staff: never side by side.
+    workers = 1 if DECODE_HOOK.on() else staff_workers()
     if workers > 1:
         load_model(config)  # once, before the threads share it
         with ThreadPoolExecutor(max_workers=workers) as pool:
