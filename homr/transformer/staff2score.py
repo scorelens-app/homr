@@ -4,11 +4,12 @@ from time import perf_counter
 import numpy as np
 from PIL import Image
 
+from homr.export import EXPORT
 from homr.simple_logging import eprint
 from homr.transformer.configs import Config
 from homr.transformer.decoder_inference import get_decoder
 from homr.transformer.encoder_inference import Encoder
-from homr.transformer.vocabulary import EncodedSymbol
+from homr.transformer.vocabulary import EncodedSymbol, _split_articulations
 from homr.type_definitions import NDArray
 
 
@@ -59,7 +60,35 @@ class Staff2Score:
 
         eprint(f"Inference Time Tromr: {perf_counter()-t0}")
 
-        return out
+        return fold_to_455_tokens(out)
+
+
+def _fold_articulation(articulation: str) -> str:
+    parts = [p for p in _split_articulations(articulation) if not p.startswith("dynamic_")]
+    parts = sorted({"accent" if p == "accentStrong" else p for p in parts})
+    return "_".join(parts) if parts else ("_" if articulation not in (".", "") else articulation)
+
+
+def fold_to_455_tokens(symbols: list[EncodedSymbol]) -> list[EncodedSymbol]:
+    """Probe of model run 509/512 on the 455-era pipeline: map the newer vocabulary onto the tokens the
+    pipeline knows. Voice-2 positions fold into their staff (upper2 -> upper, lower2 -> lower), dynamics
+    tokens are dropped (marked removed in the export), accentStrong reads as accent and dynamic modifiers
+    leave the articulation."""
+    result: list[EncodedSymbol] = []
+    dropped: list[str] = []
+    for symbol in symbols:
+        if symbol.rhythm.startswith("dynamic_"):
+            if symbol.export_id:
+                dropped.append(symbol.export_id)
+            continue
+        if symbol.position in ("upper2", "lower2"):
+            symbol.position = symbol.position[:-1]
+        if "dynamic_" in symbol.articulation or "accentStrong" in symbol.articulation:
+            symbol.articulation = _fold_articulation(symbol.articulation)
+        result.append(symbol)
+    if dropped and EXPORT.on():
+        EXPORT.mark(dropped, "removed", reason="dynamic_token")
+    return result
 
 
 class ConvertToArray:

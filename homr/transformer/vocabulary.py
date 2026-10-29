@@ -11,6 +11,37 @@ nonote = "."
 empty = "_"  # used for decorations on note, if there is no decoration
 
 VALID_TIME_SIGNATURE_DENOMINATORS = [1, 2, 3, 4, 6, 8, 12, 16, 32, 48]
+DYNAMICS = [
+    "pppp",
+    "ppp",
+    "pp",
+    "p",
+    "mp",
+    "mf",
+    "f",
+    "ff",
+    "fff",
+    "sfz",
+    "sffz",
+    "fp",
+    "sf",
+    "fz",
+    "rf",
+    "rfz",
+    "sfp",
+    "empty",
+]
+DYNAMICS_MODIFIER = [
+    "piu",
+    "dolce",
+    "poco",
+    "espress",
+    "subito",
+    "atempo",
+    "leggiero",
+    "pocopiu",
+    "sempre",
+]
 
 
 def build_dict(tokens: Iterable[str]) -> dict[str, int]:
@@ -70,17 +101,7 @@ def build_rhythm() -> dict[str, int]:
     rhythm.extend([f"rest_{d}" for d in irregular_durations])
 
     # Dynamics
-    # rhythm.extend(
-    #    [f"dynamic_{d}" for d in ["ppp", "pp", "p", "mp", "mf", "f", "ff", "fff", "sfz", "fp"]]
-    # )
-    # rhythm.extend(
-    #    [
-    #        "crescendoStart",
-    #        "crescendoEnd",
-    #        "diminuendoStart",
-    #        "diminuendoEnd",
-    #    ]
-    # )
+    rhythm.extend([f"dynamic_{d}" for d in DYNAMICS])
 
     return build_dict(rhythm)
 
@@ -94,8 +115,40 @@ def build_position() -> dict[str, int]:
     """
     The staff position, applies to notes, rests and clefs
     """
-    positions = [nonote, "upper", "lower"]
+    positions = [nonote, "upper", "upper2", "lower", "lower2"]
     return build_dict(positions)
+
+
+def is_lower_position(position: str) -> bool:
+    return position.startswith("lower")
+
+
+def is_upper_or_has_no_position(position: str) -> bool:
+    return not is_lower_position(position)
+
+
+def _split_articulations(articulation: str) -> list[str]:
+    """Split combined articulations while keeping dynamic modifiers intact.
+
+    Dynamic modifiers use the ``dynamic_`` prefix as part of their vocabulary
+    token (for example ``dynamic_dolce``), so that underscore is not a
+    separator.
+    """
+    parts = [part for part in articulation.split("_") if part]
+    result: list[str] = []
+    index = 0
+    while index < len(parts):
+        if (
+            parts[index] == "dynamic"
+            and index + 1 < len(parts)
+            and parts[index + 1] in DYNAMICS_MODIFIER
+        ):
+            result.append(f"dynamic_{parts[index + 1]}")
+            index += 2
+        else:
+            result.append(parts[index])
+            index += 1
+    return result
 
 
 def build_articulation() -> dict[str, int]:
@@ -105,6 +158,7 @@ def build_articulation() -> dict[str, int]:
     # so we use it to define this list
     articulations_lieder = [
         "accent",
+        "accent_accentStrong",
         "accent_arpeggiate",
         "accent_arpeggiate_fermata",
         "accent_arpeggiate_staccato",
@@ -121,6 +175,23 @@ def build_articulation() -> dict[str, int]:
         "accent_tenuto",
         "accent_tremolo",
         "accent_trill",
+        "accentStrong",
+        "accentStrong_arpeggiate",
+        "accentStrong_arpeggiate_fermata",
+        "accentStrong_arpeggiate_staccato",
+        "accentStrong_arpeggiate_tenuto",
+        "accentStrong_breathMark",
+        "accentStrong_breathMark_fermata",
+        "accentStrong_fermata",
+        "accentStrong_fermata_tremolo",
+        "accentStrong_staccatissimo",
+        "accentStrong_staccato",
+        "accentStrong_staccato_tenuto",
+        "accentStrong_staccato_tremolo",
+        "accentStrong_staccato_trill",
+        "accentStrong_tenuto",
+        "accentStrong_tremolo",
+        "accentStrong_trill",
         "arpeggiate",
         "arpeggiate_breathMark",
         "arpeggiate_fermata",
@@ -167,6 +238,7 @@ def build_articulation() -> dict[str, int]:
     ]
 
     articulation.extend(articulations_lieder)
+    articulation.extend([f"dynamic_{d}" for d in DYNAMICS_MODIFIER])
 
     return build_dict(articulation)
 
@@ -186,7 +258,7 @@ def build_pitch() -> dict[str, int]:
 
 
 def has_rhythm_symbol_a_position(rhythm: str) -> bool:
-    return rhythm.startswith(("note", "rest", "clef"))
+    return rhythm.startswith(("note", "rest", "clef", "dynamic"))
 
 
 class Vocabulary:
@@ -304,6 +376,8 @@ class EncodedSymbol:
         # this ordering can be used to reject cases where attention-based coordinates
         # violate monotonic scan constraints and are therefore unreliable.
         self.coordinates = coordinates
+        # The coordinates mapped back to the image which was given to homr as input
+        self.image_coordinates: tuple[float, float] | None = None
         self._duration: SymbolDuration | None = None
         # Set only with --export: the decoded token's id in the export files.
         self.export_id: str | None = None
@@ -340,10 +414,10 @@ class EncodedSymbol:
         return result
 
     def to_upper_position(self) -> "EncodedSymbol":
-        if self.position != "lower":
+        if is_upper_or_has_no_position(self.position):
             return self
         result = copy.copy(self)
-        result.position = "upper"
+        result.position = self.position.replace("lower", "upper")
         return result
 
     def is_valid(self) -> bool:
@@ -357,7 +431,7 @@ class EncodedSymbol:
     def add_articulations(self, articulations: list[str]) -> "EncodedSymbol":
         all_articulations = []
         all_articulations.extend(articulations)
-        all_articulations.extend([a for a in self.articulation.split("_") if a])
+        all_articulations.extend(_split_articulations(self.articulation))
         result = copy.copy(self)
         result.articulation = str.join("_", sorted(all_articulations))
         return result
@@ -377,9 +451,7 @@ class EncodedSymbol:
             return [], copy.copy(self)
         stripped = []
         remaining = []
-        for articulation in self.articulation.split("_"):
-            if not articulation:
-                continue
+        for articulation in _split_articulations(self.articulation):
             if remove_all or articulation in to_be_removed:
                 stripped.append(articulation)
             else:
@@ -475,7 +547,7 @@ def _remove_redudant_clefs_keys_and_time_signatures(
         result = []
         for symbol in chord:
             if symbol.rhythm.startswith("clef"):
-                if symbol.position == "upper":
+                if is_upper_or_has_no_position(symbol.position):
                     if symbol.rhythm != clef_upper:
                         clef_upper = symbol.rhythm
                         result.append(symbol)
@@ -610,7 +682,7 @@ def _only_keep_lower_staff_if_there_is_a_clef(
         for symbol in chord:
             if has_lower_clef:
                 result.append(symbol)
-            elif i < 5 and symbol.rhythm.startswith("clef") and symbol.position == "lower":
+            elif i < 5 and symbol.rhythm.startswith("clef") and is_lower_position(symbol.position):
                 has_lower_clef = True
                 result.append(symbol)
             else:
